@@ -1,0 +1,5 @@
+﻿__pycache__/
+edinet_downloads/
+reports_*/
+data/
+*.ps1
