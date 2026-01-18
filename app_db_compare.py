@@ -1,4 +1,4 @@
-# app_db_compare.py（JPX33業種・確定仕様 + CSVをDB比較に混ぜる版・全文 / 上部操作UI横並び / 削除・CSV全削除安定版）
+# app_db_compare.py（JPX33業種・確定仕様 + CSVをDB比較に混ぜる版・全文）
 # ✅ 仕様
 # - 業界名はJPX33（industry_master.sector33）だけ（EDINET業種は使わない）
 # - 会社検索：会社名検索のみ
@@ -7,7 +7,7 @@
 # - 上部UI：企業検索 / 業界 / 期間 / CSV を横並び
 # - 業界平均トグル／分析トグルあり
 # - CSVはDB比較に混ぜる（CSVは企業として追加、最大8件はDB+CSV合算）
-# - 比較中：最大8件、1件1行、右端×削除、全解除（on_clickで安定）
+# - 比較中：最大8件、1件1行、右端×削除、全解除（安定）
 # - 期間：2016〜2025 slider（DB/CSV共通）
 # - 最新年比較表：なし
 # - グラフ：単位明示（売上/利益/CF=億円、比率=%）
@@ -20,10 +20,12 @@
 #    - file_uploader が保持するアップロード済みファイルで再追加されるのを防ぐため、
 #      追加済みCSVファイル名を csv_uploaded_names に記録し、同名は自動再追加しない
 #    - CSV全削除 / 全解除のときは uploader_key を増やして file_uploader を作り直し「選択済み」を消す
-# ❌ 排除：履歴リセットボタン
+# ✅ 全解除が「戻る」対策：
+#    - 会社候補multiselectの key を可変にし、全解除で key を増やしてウィジェットごと作り直す
 
 import sqlite3
 from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 
@@ -290,12 +292,12 @@ def classify_cf_type(cfo, cfi, cff) -> str | None:
 
     key = ("+" if cfo >= 0 else "-", "+" if cfi >= 0 else "-", "+" if cff >= 0 else "-")
     return {
-        ("+","-","-"): "優良企業型",
-        ("+","-","+"): "積極投資型",
-        ("+","+","-"): "選択と集中型",
-        ("-","-","+"): "ベンチャー型",
-        ("-","+","-"): "じり貧型",
-        ("-","+","+"): "危険水域型",
+        ("+", "-", "-"): "優良企業型",
+        ("+", "-", "+"): "積極投資型",
+        ("+", "+", "-"): "選択と集中型",
+        ("-", "-", "+"): "ベンチャー型",
+        ("-", "+", "-"): "じり貧型",
+        ("-", "+", "+"): "危険水域型",
     }.get(key, None)
 
 
@@ -311,7 +313,7 @@ def fill_cf_type(df: pd.DataFrame) -> pd.DataFrame:
     if need.any():
         df.loc[need, "cf_type"] = df.loc[need].apply(
             lambda r: classify_cf_type(r.get("cfo"), r.get("cfi"), r.get("cff")),
-            axis=1
+            axis=1,
         )
     return df
 
@@ -429,10 +431,7 @@ def load_industry_avg_jpx33(sector33: str, y_min: int, y_max: int) -> pd.DataFra
 def pivot_by_code(df: pd.DataFrame, value_col: str, code_to_label: dict[str, str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    p = (
-        df.pivot_table(index="fiscal_year", columns="edinet_code", values=value_col, aggfunc="first")
-        .sort_index()
-    )
+    p = df.pivot_table(index="fiscal_year", columns="edinet_code", values=value_col, aggfunc="first").sort_index()
     return p.rename(columns=code_to_label)
 
 
@@ -553,12 +552,14 @@ if "csv_items" not in st.session_state:
 if "csv_uploaded_names" not in st.session_state:
     st.session_state.csv_uploaded_names = set()
 if "csv_uploader_key" not in st.session_state:
-    # file_uploader を作り直して「選択済みファイル」を消すため
     st.session_state.csv_uploader_key = 0
+# ★ 会社候補 multiselect の key を差し替えるため
+if "pick_key" not in st.session_state:
+    st.session_state.pick_key = 0
 
 
 # =========================
-# 削除（×）安定化：コールバック
+# 削除（×）安定化
 # =========================
 def _remove_from_compare(code: str):
     if str(code).startswith("CSV:"):
@@ -568,18 +569,39 @@ def _remove_from_compare(code: str):
         st.session_state.selected_codes = [c for c in st.session_state.selected_codes if c != code]
 
 
+def _reset_company_picker_widget():
+    """会社候補 multiselect の選択状態を“ウィジェットごと”リセットする"""
+    cur_key = f"pick_labels_{st.session_state.pick_key}"
+    st.session_state.pop(cur_key, None)
+    st.session_state.pick_key += 1
+    st.session_state.search_prev_picks = []
+
+
+def _reset_csv_uploader_widget():
+    """CSV uploader の選択状態を“ウィジェットごと”リセットする"""
+    cur_key = f"csv_uploader_in_main_{st.session_state.csv_uploader_key}"
+    st.session_state.pop(cur_key, None)
+    st.session_state.csv_uploader_key += 1
+
+
 def _clear_all():
     st.session_state.selected_codes = []
     st.session_state.csv_items = []
-    st.session_state.search_prev_picks = []
     st.session_state.csv_uploaded_names = set()
-    st.session_state.csv_uploader_key += 1  # uploaderを作り直して選択済みを消す
+
+    # ★ 全解除で「候補が保持されて再追加」されるのを防ぐ
+    _reset_company_picker_widget()
+
+    # ★ CSV uploader も完全リセット
+    _reset_csv_uploader_widget()
 
 
 def _clear_csv_only():
     st.session_state.csv_items = []
     st.session_state.csv_uploaded_names = set()
-    st.session_state.csv_uploader_key += 1  # uploaderを作り直して選択済みを消す
+
+    # ★ uploader の内部保持（選択済み）を確実に捨てる
+    _reset_csv_uploader_widget()
 
 
 # =========================
@@ -606,6 +628,7 @@ with col_search:
     label_to_code = {}
 
     if not df_hits.empty:
+
         def _lab(r):
             s = (r.get("sector33") or "").strip() or "業界不明"
             return f"{r['name']}（{s}）"
@@ -613,11 +636,13 @@ with col_search:
         df_hits["label"] = df_hits.apply(_lab, axis=1)
         label_to_code = dict(zip(df_hits["label"].tolist(), df_hits["edinet_code"].tolist()))
 
+        pick_widget_key = f"pick_labels_{st.session_state.pick_key}"
+
         picked_labels = st.multiselect(
             "候補（選んだ瞬間に追加／保持）",
             options=df_hits["label"].tolist(),
             default=[],
-            key="pick_labels",
+            key=pick_widget_key,
         )
 
         prev = set(st.session_state.search_prev_picks)
@@ -640,7 +665,9 @@ with col_search:
                     capacity -= 1
 
             added = [c for c in st.session_state.selected_codes if c not in before]
-            if not added and (len(list(st.session_state.selected_codes) + [it["id"] for it in st.session_state.csv_items]) >= MAX_COMPANIES):
+            if not added and (
+                len(list(st.session_state.selected_codes) + [it["id"] for it in st.session_state.csv_items]) >= MAX_COMPANIES
+            ):
                 st.warning(f"最大{MAX_COMPANIES}件までです。先に『比較中』から外してください。")
             elif added:
                 st.success(f"{len(added)}件 追加しました。")
@@ -665,13 +692,15 @@ with col_sector:
         "JPX33業種",
         options=sector33_options,
         index=sector33_options.index(st.session_state.sector33_sel)
-        if st.session_state.sector33_sel in sector33_options else 0,
+        if st.session_state.sector33_sel in sector33_options
+        else 0,
         key="sector_box",
     )
 
     if new_sector != st.session_state.sector33_sel:
         st.session_state.sector33_sel = new_sector
-        st.session_state.search_prev_picks = []
+        # ★ 業界を変えたら候補選択もリセット（誤再追加防止）
+        _reset_company_picker_widget()
         st.rerun()
 
     st.session_state.show_avg = st.toggle("業界平均", value=st.session_state.show_avg, key="tog_avg")
@@ -748,12 +777,11 @@ with col_csv:
 
                 d1 = fill_cf_type(d1)
 
-                d1 = d1[["edinet_code", "fiscal_year", "sales", "net_income", "equity_ratio", "current_ratio", "cfo", "cfi", "cff", "cf_type"]]
+                d1 = d1[
+                    ["edinet_code", "fiscal_year", "sales", "net_income", "equity_ratio", "current_ratio", "cfo", "cfi", "cff", "cf_type"]
+                ]
 
-                st.session_state.csv_items.append(
-                    {"id": csv_id, "label": f"{f.name}（CSV）", "df": d1}
-                )
-
+                st.session_state.csv_items.append({"id": csv_id, "label": f"{f.name}（CSV）", "df": d1})
                 st.session_state.csv_uploaded_names.add(f.name)
 
                 added_n += 1
@@ -767,7 +795,8 @@ with col_csv:
 
     # CSVだけ全削除（完全に消す：items + 履歴 + uploader）
     if st.session_state.csv_items:
-        if st.button("CSV全削除", use_container_width=True, key="csv_clear_all", on_click=_clear_csv_only):
+        if st.button("CSV全削除", use_container_width=True, key="csv_clear_all"):
+            _clear_csv_only()
             st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -816,7 +845,12 @@ for i, (code, disp) in enumerate(zip(ordered_codes, ordered_display), start=1):
         )
 
 st.markdown('<div class="muted">※ 上から順に比較されます。</div>', unsafe_allow_html=True)
-st.button("全解除", on_click=_clear_all)
+
+# ★ 全解除：button True → 実行 → rerun
+if st.button("全解除", key="btn_clear_all"):
+    _clear_all()
+    st.rerun()
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 
