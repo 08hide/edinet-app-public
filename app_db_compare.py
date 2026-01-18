@@ -4,27 +4,22 @@
 # - 会社検索：会社名検索のみ
 # - 検索候補：metrics_yearlyにデータがある企業のみ
 # - 候補表示：会社名（JPX33業種）※紐付かない場合は「業界不明」
-# - 上部UI：企業検索 / 業界 / 期間 / CSV を横並び
-# - 業界平均トグル／分析トグルあり
+# - 上部UI：企業検索 / 業界 / 期間 / CSV を横並び（サイドバー未使用）
+# - 業界平均トグル／分析トグルあり（DB企業のみで算出）
 # - CSVはDB比較に混ぜる（CSVは企業として追加、最大8件はDB+CSV合算）
 # - 比較中：最大8件、1件1行、右端×削除、全解除（安定）
 # - 期間：2016〜2025 slider（DB/CSV共通）
-# - 最新年比較表：なし
-# - グラフ：単位明示（売上/利益/CF=億円、比率=%）
+# - グラフ：st.line_chart（形態は維持）
+# - 凡例：多いと見えなくなる問題を「自動短縮」で必ず収める（最悪 A/B/C…＋対応表）
 # - CF表：企業ごとに分けて表示、最初から展開
 # - 生データ表示トグル、CSVダウンロードあり
-# ✅ テンプレ：ボタンのみ（cf_type列なし）
-# ✅ CF型：CSVに無くてもCFO/CFI/CFFの符号から自動補完（企業タイプまとめセクションは作らない）
-# ✅ 「グラフからわかること」：企業ごとにブロック分け（改行）
-# ✅ CSVの削除が復活しない対策：
-#    - file_uploader が保持するアップロード済みファイルで再追加されるのを防ぐため、
-#      追加済みCSVファイル名を csv_uploaded_names に記録し、同名は自動再追加しない
-#    - CSV全削除 / 全解除のときは uploader_key を増やして file_uploader を作り直し「選択済み」を消す
-# ✅ 全解除が「戻る」対策：
-#    - 会社候補multiselectの key を可変にし、全解除で key を増やしてウィジェットごと作り直す
+# ✅ 銀行の流動比率：
+# - 流動比率グラフでは「（銀行業）」が付いている系列だけ非表示（DB結合に依存しない＝確実）
+# - さらに、業界フィルタが「銀行業」のときは、流動比率グラフの業界平均線も表示しない
 
 import sqlite3
 from io import BytesIO
+import string
 
 import pandas as pd
 import streamlit as st
@@ -265,25 +260,107 @@ def filter_years(df: pd.DataFrame, y_min: int, y_max: int) -> pd.DataFrame:
     return df[(df["fiscal_year"] >= y_min) & (df["fiscal_year"] <= y_max)].copy()
 
 
-def to_pct(series_or_value):
-    """0-1 / 0-100 の揺れを吸収して % へ寄せる"""
+def to_pct(series_or_value, ratio_threshold: float = 1.5):
+    """
+    比率データを % に正規化する
+    ratio_threshold:
+      - 自己資本比率 → 1.5
+      - 流動比率     → 10.0
+    """
     s = pd.to_numeric(series_or_value, errors="coerce")
     if isinstance(s, pd.Series):
         if s.dropna().empty:
             return s
         mx = s.dropna().abs().max()
-        return s * 100 if mx <= 1.5 else s
+        return s * 100 if mx <= ratio_threshold else s
     else:
         if pd.isna(s):
             return s
-        return s * 100 if abs(float(s)) <= 1.5 else s
+        return s * 100 if abs(float(s)) <= ratio_threshold else s
+
+
+# =========================
+# 凡例短縮（st.line_chartのまま“収まる”ように）
+# =========================
+def _legend_base_name(label: str) -> str:
+    if label is None:
+        return ""
+    s = str(label).strip()
+    if "（" in s:
+        s = s.split("（")[0].strip()
+
+    s = s.replace("株式会社", "")
+    s = s.replace("ホールディングス", "HD")
+    s = s.replace("ホールディング", "HD")
+    s = s.replace("グループ", "G")
+    s = s.replace("コーポレーション", "Corp")
+    s = s.replace("インターナショナル", "Intl")
+    s = s.replace("ジャパン", "JP")
+    return s.strip()
+
+
+def _shorten_to_len(s: str, max_len: int) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= max_len:
+        return s
+    if max_len <= 1:
+        return "…"
+    return s[: max_len - 1] + "…"
+
+
+def _estimate_total_legend_chars(labels: list[str]) -> int:
+    return sum(len(x) + 2 for x in labels)
+
+
+def make_compact_legend_map(columns_in_chart: list[str], force_budget: int | None = None) -> tuple[dict[str, str], list[str] | None]:
+    full_labels = [str(c) for c in columns_in_chart]
+    base = [_legend_base_name(x) for x in full_labels]
+    n = len(base)
+
+    if force_budget is not None:
+        budget = int(force_budget)
+    else:
+        if n <= 3:
+            budget = 120
+        elif n <= 5:
+            budget = 95
+        elif n <= 7:
+            budget = 80
+        elif n <= 9:
+            budget = 68
+        else:
+            budget = 60
+
+    for max_len in [18, 16, 14, 12, 11, 10, 9, 8, 7, 6]:
+        cand = [_shorten_to_len(x, max_len) for x in base]
+        if _estimate_total_legend_chars(cand) <= budget:
+            seen = {}
+            fixed = []
+            for x in cand:
+                if x not in seen:
+                    seen[x] = 1
+                    fixed.append(x)
+                else:
+                    seen[x] += 1
+                    suffix = str(seen[x])
+                    z = x
+                    if len(z) + len(suffix) > max_len:
+                        z = _shorten_to_len(z, max(1, max_len - len(suffix)))
+                    fixed.append(z + suffix)
+            return {full: short for full, short in zip(full_labels, fixed)}, None
+
+    alphabet = list(string.ascii_uppercase)
+    compact = [(alphabet[i] if i < len(alphabet) else f"Z{i+1}") for i in range(n)]
+    note = ["凡例対応表："] + [f"{compact[i]} = {base[i] or full_labels[i]}" for i in range(n)]
+    return {full_labels[i]: compact[i] for i in range(n)}, note
 
 
 # =========================
 # CF型（cf_type）自動補完
 # =========================
 def classify_cf_type(cfo, cfi, cff) -> str | None:
-    """CFO/CFI/CFF の符号でCF型を返す（欠損があれば None）"""
     cfo = pd.to_numeric(cfo, errors="coerce")
     cfi = pd.to_numeric(cfi, errors="coerce")
     cff = pd.to_numeric(cff, errors="coerce")
@@ -302,10 +379,8 @@ def classify_cf_type(cfo, cfi, cff) -> str | None:
 
 
 def fill_cf_type(df: pd.DataFrame) -> pd.DataFrame:
-    """df の cf_type が空の行を CFO/CFI/CFF から補完する"""
     if df is None or df.empty:
         return df
-
     if "cf_type" not in df.columns:
         df["cf_type"] = pd.NA
 
@@ -330,13 +405,6 @@ def _read_csv_uploaded(file) -> pd.DataFrame:
 
 
 def _normalize_csv_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    CSV → metrics_yearly互換の列に寄せる
-    必須: year or fiscal_year
-    任意: sales/sales_yen, net_income/net_income_yen, equity_ratio(_pct), current_ratio(_pct),
-         cfo/cfo_yen, cfi/cfi_yen, cff/cff_yen
-    ※ cf_type は不要（自動で埋める）
-    """
     df = df.copy()
 
     if "fiscal_year" not in df.columns and "year" in df.columns:
@@ -361,9 +429,10 @@ def _normalize_csv_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "equity_ratio" in df.columns:
-        df["equity_ratio"] = to_pct(df["equity_ratio"])
+        df["equity_ratio"] = to_pct(df["equity_ratio"], ratio_threshold=1.5)
     if "current_ratio" in df.columns:
-        df["current_ratio"] = to_pct(df["current_ratio"])
+        df["current_ratio"] = to_pct(df["current_ratio"], ratio_threshold=10.0)
+
 
     if df["fiscal_year"].dropna().empty:
         raise ValueError("CSVに year または fiscal_year がありません。")
@@ -419,8 +488,8 @@ def load_industry_avg_jpx33(sector33: str, y_min: int, y_max: int) -> pd.DataFra
 
     out["sales_oku"] = g["sales"].mean() / 1e8
     out["net_income_oku"] = g["net_income"].mean() / 1e8
-    out["equity_ratio_pct"] = to_pct(g["equity_ratio"].mean())
-    out["current_ratio_pct"] = to_pct(g["current_ratio"].mean())
+    out["equity_ratio_pct"] = to_pct(g["equity_ratio"].mean(), ratio_threshold=1.5)
+    out["current_ratio_pct"] = to_pct(g["current_ratio"].mean(), ratio_threshold=10.0)
     out["cfo_oku"] = g["cfo"].mean() / 1e8
     out["cfi_oku"] = g["cfi"].mean() / 1e8
     out["cff_oku"] = g["cff"].mean() / 1e8
@@ -442,7 +511,6 @@ def add_avg_line(chart_df: pd.DataFrame, avg_series: pd.Series, label: str) -> p
 
 
 def make_analysis(chart_df: pd.DataFrame, unit: str, avg_label: str | None = None) -> list[str]:
-    """企業ごとにブロック分けして返す（改行あり）"""
     if chart_df.empty or len(chart_df.index) < 2:
         return ["データが少ないため分析できません。"]
 
@@ -504,7 +572,6 @@ st.markdown(
         margin: 10px 0 14px; backdrop-filter: blur(10px);
       }
 
-      /* 見出しを大きく */
       .panel-title { font-size: 18px; font-weight: 900; margin: 0 0 10px; color: #0f172a; }
       .section-title { font-size: 20px; font-weight: 950; margin: 18px 0 10px; color: #0f172a; }
 
@@ -553,24 +620,21 @@ if "csv_uploaded_names" not in st.session_state:
     st.session_state.csv_uploaded_names = set()
 if "csv_uploader_key" not in st.session_state:
     st.session_state.csv_uploader_key = 0
-# ★ 会社候補 multiselect の key を差し替えるため
 if "pick_key" not in st.session_state:
     st.session_state.pick_key = 0
 
 
 # =========================
-# 削除（×）安定化
+# 削除・リセット
 # =========================
 def _remove_from_compare(code: str):
     if str(code).startswith("CSV:"):
         st.session_state.csv_items = [it for it in st.session_state.csv_items if it["id"] != code]
-        # csv_uploaded_names は消さない（削除後に同名が自動復活しない）
     else:
         st.session_state.selected_codes = [c for c in st.session_state.selected_codes if c != code]
 
 
 def _reset_company_picker_widget():
-    """会社候補 multiselect の選択状態を“ウィジェットごと”リセットする"""
     cur_key = f"pick_labels_{st.session_state.pick_key}"
     st.session_state.pop(cur_key, None)
     st.session_state.pick_key += 1
@@ -578,7 +642,6 @@ def _reset_company_picker_widget():
 
 
 def _reset_csv_uploader_widget():
-    """CSV uploader の選択状態を“ウィジェットごと”リセットする"""
     cur_key = f"csv_uploader_in_main_{st.session_state.csv_uploader_key}"
     st.session_state.pop(cur_key, None)
     st.session_state.csv_uploader_key += 1
@@ -588,19 +651,13 @@ def _clear_all():
     st.session_state.selected_codes = []
     st.session_state.csv_items = []
     st.session_state.csv_uploaded_names = set()
-
-    # ★ 全解除で「候補が保持されて再追加」されるのを防ぐ
     _reset_company_picker_widget()
-
-    # ★ CSV uploader も完全リセット
     _reset_csv_uploader_widget()
 
 
 def _clear_csv_only():
     st.session_state.csv_items = []
     st.session_state.csv_uploaded_names = set()
-
-    # ★ uploader の内部保持（選択済み）を確実に捨てる
     _reset_csv_uploader_widget()
 
 
@@ -637,7 +694,6 @@ with col_search:
         label_to_code = dict(zip(df_hits["label"].tolist(), df_hits["edinet_code"].tolist()))
 
         pick_widget_key = f"pick_labels_{st.session_state.pick_key}"
-
         picked_labels = st.multiselect(
             "候補（選んだ瞬間に追加／保持）",
             options=df_hits["label"].tolist(),
@@ -665,9 +721,7 @@ with col_search:
                     capacity -= 1
 
             added = [c for c in st.session_state.selected_codes if c not in before]
-            if not added and (
-                len(list(st.session_state.selected_codes) + [it["id"] for it in st.session_state.csv_items]) >= MAX_COMPANIES
-            ):
+            if not added and (len(st.session_state.selected_codes) + len(st.session_state.csv_items) >= MAX_COMPANIES):
                 st.warning(f"最大{MAX_COMPANIES}件までです。先に『比較中』から外してください。")
             elif added:
                 st.success(f"{len(added)}件 追加しました。")
@@ -692,14 +746,12 @@ with col_sector:
         "JPX33業種",
         options=sector33_options,
         index=sector33_options.index(st.session_state.sector33_sel)
-        if st.session_state.sector33_sel in sector33_options
-        else 0,
+        if st.session_state.sector33_sel in sector33_options else 0,
         key="sector_box",
     )
 
     if new_sector != st.session_state.sector33_sel:
         st.session_state.sector33_sel = new_sector
-        # ★ 業界を変えたら候補選択もリセット（誤再追加防止）
         _reset_company_picker_widget()
         st.rerun()
 
@@ -728,7 +780,6 @@ with col_year:
 with col_csv:
     st.markdown('<div class="panel"><div class="panel-title">CSV</div>', unsafe_allow_html=True)
 
-    # テンプレ（cf_typeなし）
     template_csv = "fiscal_year,sales,net_income,equity_ratio,current_ratio,cfo,cfi,cff\n"
     st.download_button(
         "テンプレDL",
@@ -756,8 +807,6 @@ with col_csv:
         for f in uploaded:
             if capacity <= 0:
                 break
-
-            # ★削除後に復活しない：追加済みファイル名は再追加しない
             if f.name in st.session_state.csv_uploaded_names:
                 continue
 
@@ -770,15 +819,14 @@ with col_csv:
                 d1 = d1.copy()
                 d1["edinet_code"] = csv_id
 
-                # 足りない列を補完（欠けてても動く）
                 for col in ["sales", "net_income", "equity_ratio", "current_ratio", "cfo", "cfi", "cff", "cf_type"]:
                     if col not in d1.columns:
                         d1[col] = pd.NA
 
                 d1 = fill_cf_type(d1)
-
                 d1 = d1[
-                    ["edinet_code", "fiscal_year", "sales", "net_income", "equity_ratio", "current_ratio", "cfo", "cfi", "cff", "cf_type"]
+                    ["edinet_code", "fiscal_year", "sales", "net_income", "equity_ratio", "current_ratio",
+                     "cfo", "cfi", "cff", "cf_type"]
                 ]
 
                 st.session_state.csv_items.append({"id": csv_id, "label": f"{f.name}（CSV）", "df": d1})
@@ -793,7 +841,6 @@ with col_csv:
         if added_n:
             st.success(f"{added_n}件 追加")
 
-    # CSVだけ全削除（完全に消す：items + 履歴 + uploader）
     if st.session_state.csv_items:
         if st.button("CSV全削除", use_container_width=True, key="csv_clear_all"):
             _clear_csv_only()
@@ -813,10 +860,7 @@ combined_codes = list(st.session_state.selected_codes) + [it["id"] for it in st.
 ordered_codes = combined_codes[:MAX_COMPANIES]
 ordered_display = [labels_map.get(c, {}).get("label", c) for c in ordered_codes]
 
-st.markdown(
-    f'<div class="panel"><div class="panel-title">比較中（最大{MAX_COMPANIES}件）</div>',
-    unsafe_allow_html=True,
-)
+st.markdown(f'<div class="panel"><div class="panel-title">比較中（最大{MAX_COMPANIES}件）</div>', unsafe_allow_html=True)
 
 if not ordered_codes:
     st.info("比較リストが空です。上で企業を選ぶかCSVを追加してください。")
@@ -836,17 +880,10 @@ for i, (code, disp) in enumerate(zip(ordered_codes, ordered_display), start=1):
             unsafe_allow_html=True,
         )
     with right:
-        st.button(
-            "×",
-            key=f"rm_{i}_{code}",
-            help="この項目を比較から外す",
-            on_click=_remove_from_compare,
-            args=(code,),
-        )
+        st.button("×", key=f"rm_{i}_{code}", help="この項目を比較から外す", on_click=_remove_from_compare, args=(code,))
 
 st.markdown('<div class="muted">※ 上から順に比較されます。</div>', unsafe_allow_html=True)
 
-# ★ 全解除：button True → 実行 → rerun
 if st.button("全解除", key="btn_clear_all"):
     _clear_all()
     st.rerun()
@@ -874,53 +911,80 @@ if df.empty:
     st.error("比較データがありません（DBもCSVも空）。")
     st.stop()
 
-# 期間フィルタ（stateから）
 y_min, y_max = int(st.session_state.year_range[0]), int(st.session_state.year_range[1])
 df = filter_years(df, y_min, y_max)
 
-# CF型を保険で補完（DB側の欠損も埋める）
 df = fill_cf_type(df)
 
-# 単位変換
 df["sales_oku"] = pd.to_numeric(df.get("sales"), errors="coerce") / 1e8
 df["net_income_oku"] = pd.to_numeric(df.get("net_income"), errors="coerce") / 1e8
-df["equity_ratio_pct"] = to_pct(df.get("equity_ratio"))
-df["current_ratio_pct"] = to_pct(df.get("current_ratio"))
+df["equity_ratio_pct"] = to_pct(df.get("equity_ratio"), ratio_threshold=1.5)
+df["current_ratio_pct"] = to_pct(df.get("current_ratio"), ratio_threshold=10.0)
 df["cfo_oku"] = pd.to_numeric(df.get("cfo"), errors="coerce") / 1e8
 df["cfi_oku"] = pd.to_numeric(df.get("cfi"), errors="coerce") / 1e8
 df["cff_oku"] = pd.to_numeric(df.get("cff"), errors="coerce") / 1e8
 
 code_to_label = {c: labels_map.get(c, {}).get("label", c) for c in ordered_codes}
-ordered_labels = [code_to_label[c] for c in ordered_codes]
+ordered_labels_full = [code_to_label[c] for c in ordered_codes]
+
+# ★ 銀行の線を消す対象（表示ラベルで判定する＝確実）
+bank_labels = {lbl for lbl in ordered_labels_full if "（銀行業）" in str(lbl)}
+
+selected_sector33 = None if st.session_state.sector33_sel == "（全業界）" else st.session_state.sector33_sel
+is_bank_filter = (selected_sector33 == "銀行業")
 
 # =========================
 # 業界平均（DBのみ）
 # =========================
-use_sector = None if st.session_state.sector33_sel == "（全業界）" else st.session_state.sector33_sel
 avg_label = None
 avg_df = pd.DataFrame()
-
-if st.session_state.show_avg and use_sector:
-    avg_df = load_industry_avg_jpx33(use_sector, y_min, y_max)
+if st.session_state.show_avg and selected_sector33:
+    avg_df = load_industry_avg_jpx33(selected_sector33, y_min, y_max)
     if not avg_df.empty:
-        avg_label = f"業界平均（{use_sector}）"
+        avg_label = f"業界平均（{selected_sector33}）"
 
 
-def render_chart(title: str, value_col: str, unit: str, avg_key: str | None):
+def render_chart(
+    title: str,
+    value_col: str,
+    unit: str,
+    avg_key: str | None,
+    exclude_labels: set[str] | None = None,
+    hide_avg_line: bool = False,
+    empty_message: str | None = None,
+):
     st.markdown(f'<div class="panel"><div class="panel-title">{title}</div>', unsafe_allow_html=True)
 
-    base = pivot_by_code(df, value_col, code_to_label=code_to_label)
-    if not base.empty:
-        base = base[[c for c in ordered_labels if c in base.columns]]
+    base_full = pivot_by_code(df, value_col, code_to_label=code_to_label)
+    if not base_full.empty:
+        base_full = base_full[[c for c in ordered_labels_full if c in base_full.columns]]
 
-    if avg_label and avg_key and not avg_df.empty:
-        base = add_avg_line(base, avg_df[avg_key], avg_label)
+    # 業界平均（必要なら）
+    if (not hide_avg_line) and avg_label and avg_key and not avg_df.empty:
+        base_full = add_avg_line(base_full, avg_df[avg_key], avg_label)
 
-    st.line_chart(base)
+    # ★ 銀行の系列だけ除外（流動比率用）
+    if exclude_labels:
+        keep_cols = [c for c in base_full.columns if c not in exclude_labels]
+        base_full = base_full[keep_cols] if keep_cols else pd.DataFrame(index=base_full.index)
+
+    if base_full.empty or len(base_full.columns) == 0:
+        st.info(empty_message or "表示できるデータがありません。")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    rename_map, note_lines = make_compact_legend_map(list(base_full.columns))
+    base_chart = base_full.rename(columns=rename_map)
+
+    st.line_chart(base_chart)
+
+    if note_lines:
+        with st.expander("凡例対応表（短縮が強いとき）", expanded=False):
+            st.write("\n".join(note_lines))
 
     if st.session_state.show_analysis:
         with st.expander("このグラフからわかること", expanded=False):
-            st.write("\n\n".join(make_analysis(base, unit=unit, avg_label=avg_label)))
+            st.write("\n\n".join(make_analysis(base_full, unit=unit, avg_label=avg_label)))
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -940,39 +1004,62 @@ cC, cD = st.columns(2)
 with cC:
     render_chart("自己資本比率（％）", "equity_ratio_pct", "％", "equity_ratio_pct")
 with cD:
-    render_chart("流動比率（％）", "current_ratio_pct", "％", "current_ratio_pct")
+    # ★ 流動比率：銀行の線だけ消す + 銀行業フィルタ時は平均線も消す
+    render_chart(
+        "流動比率（％）",
+        "current_ratio_pct",
+        "％",
+        "current_ratio_pct",
+        exclude_labels=bank_labels,
+        hide_avg_line=is_bank_filter,
+        empty_message="銀行業の企業は流動比率から除外しているため、表示できる線がありません。",
+    )
 
 st.markdown('<div class="section-title">キャッシュフロー</div>', unsafe_allow_html=True)
 st.markdown('<div class="panel"><div class="panel-title">営業CF / 投資CF / 財務CF（億円）</div>', unsafe_allow_html=True)
 
 cc1, cc2, cc3 = st.columns(3)
-for title, key, avg_key, col in [
+for cap, key, avg_key, col in [
     ("営業CF（億円）", "cfo_oku", "cfo_oku", cc1),
     ("投資CF（億円）", "cfi_oku", "cfi_oku", cc2),
     ("財務CF（億円）", "cff_oku", "cff_oku", cc3),
 ]:
     with col:
-        st.caption(title)
-        base = pivot_by_code(df, key, code_to_label=code_to_label)
-        if not base.empty:
-            base = base[[c for c in ordered_labels if c in base.columns]]
+        st.caption(cap)
+
+        base_full = pivot_by_code(df, key, code_to_label=code_to_label)
+        if not base_full.empty:
+            base_full = base_full[[c for c in ordered_labels_full if c in base_full.columns]]
+
         if avg_label and not avg_df.empty:
-            base = add_avg_line(base, avg_df[avg_key], avg_label)
-        st.line_chart(base)
+            base_full = add_avg_line(base_full, avg_df[avg_key], avg_label)
+
+        if base_full.empty:
+            st.info("表示できるデータがありません。")
+            continue
+
+        rename_map, note_lines = make_compact_legend_map(list(base_full.columns))
+        base_chart = base_full.rename(columns=rename_map)
+
+        st.line_chart(base_chart)
+
+        if note_lines:
+            with st.expander("凡例対応表（短縮が強いとき）", expanded=False):
+                st.write("\n".join(note_lines))
+
         if st.session_state.show_analysis:
             with st.expander("このグラフからわかること", expanded=False):
-                st.write("\n\n".join(make_analysis(base, unit="億円", avg_label=avg_label)))
+                st.write("\n\n".join(make_analysis(base_full, unit="億円", avg_label=avg_label)))
 
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# キャッシュフロー表（企業ごと・展開済み）
+# CF表（企業ごと）
 # =========================
 st.markdown('<div class="section-title">キャッシュフロー表（企業ごと）</div>', unsafe_allow_html=True)
 st.markdown('<div class="panel"><div class="panel-title">CFO / CFI / CFF（億円）とCF型（年別）</div>', unsafe_allow_html=True)
 
 cf_cols = ["fiscal_year", "cfo_oku", "cfi_oku", "cff_oku", "cf_type"]
-
 for code in ordered_codes:
     disp = code_to_label.get(code, code)
     d1 = df[df["edinet_code"] == code].copy()
