@@ -1,9 +1,10 @@
-# app_db_compare.py（JPX33業種・確定仕様 + CSVをDB比較に混ぜる版・全文）
-# ✅ 仕様
-# - 業界名はJPX33（industry_master.sector33）だけ（EDINET業種は使わない）
+# app_db_compare.py（EDINET業種・確定仕様 + CSVをDB比較に混ぜる版・全文）
+# ✅ 仕様（最新版）
+# - 業界名は「EDINETコードリスト由来（companies.edinet_industry）」を使う
+#   - 英語表記の場合は、日本語表記へ変換（下のEDINET_INDUSTRY_MAP）
 # - 会社検索：会社名検索のみ
 # - 検索候補：metrics_yearlyにデータがある企業のみ
-# - 候補表示：会社名（JPX33業種）※紐付かない場合は「業界不明」
+# - 候補表示：会社名（EDINET業種）※無い場合は「業界不明」
 # - 上部UI：企業検索 / 業界 / 期間 / CSV を横並び（サイドバー未使用）
 # - 業界平均トグル／分析トグルあり（DB企業のみで算出）
 # - CSVはDB比較に混ぜる（CSVは企業として追加、最大8件はDB+CSV合算）
@@ -14,12 +15,11 @@
 # - CF表：企業ごとに分けて表示、最初から展開
 # - 生データ表示トグル、CSVダウンロードあり
 # ✅ 銀行の流動比率：
-# - 流動比率グラフでは「（銀行業）」が付いている系列だけ非表示（DB結合に依存しない＝確実）
+# - 流動比率グラフでは「（銀行業）」が付いている系列だけ非表示（表示ラベル判定で確実）
 # - さらに、業界フィルタが「銀行業」のときは、流動比率グラフの業界平均線も表示しない
-#
-# ✅ 重要修正（縦軸おかしい対策）
-# - 比率の単位混在（2.7 と 270 など）を「値ごとに」%正規化して吸収する（Series全体max判定は廃止）
-# - 業界平均は「正規化してから平均」を取る（混在のまま平均すると壊れるため）
+# ✅ 流動比率の縦軸対策：
+# - DB内で 2.7（=270%）/ 270（=270%）など単位混在がある前提
+# - to_pct() は「値ごとに」閾値判定して % に揃える（列全体のmax判定はしない）
 
 import sqlite3
 from io import BytesIO
@@ -36,8 +36,69 @@ Y_MAX_FIXED = 2025
 
 
 # =========================
+# EDINET業種（英語→日本語）
+# =========================
+# DB内の英語表記（edinet_industry_english_unique.csv）に合わせて作成
+EDINET_INDUSTRY_MAP = {
+    "Others": "その他",
+    "Services": "サービス業",
+    "Information & Communication": "情報・通信業",
+    "Retail Trade": "小売業",
+    "Wholesale Trade": "卸売業",
+    "Electric Appliances": "電気機器",
+    "Machinery": "機械",
+    "Chemicals": "化学",
+    "Construction": "建設業",
+    "Real Estate": "不動産業",
+    "Foods": "食料品",
+    "Other Products": "その他製品",
+    "Banks": "銀行業",
+    "Land Transportation": "陸運業",
+    "Metal Products": "金属製品",
+    "Transportation Equipments": "輸送用機器",
+    "Transportation Equipment": "輸送用機器",
+    "Pharmaceutical": "医薬品",
+    "Other Financing Business": "その他金融業",
+    "Other Financial Business": "その他金融業",
+    "Glass & Ceramics Products": "ガラス・土石製品",
+    "Rubber Products": "ゴム製品",
+    "Pulp & Paper": "パルプ・紙",
+    "Securities & Commodity Futures": "証券、商品先物取引業",
+    "Warehousing & Harbor Transportation Services": "倉庫・運輸関連",
+    "Iron & Steel": "鉄鋼",
+    "Nonferrous Metals": "非鉄金属",
+    "Electric Power & Gas": "電気・ガス業",
+    "Insurance": "保険業",
+    "Marine Transportation": "海運業",
+    "Air Transportation": "空運業",
+    "Mining": "鉱業",
+    "Precision Instruments": "精密機器",
+    "Textiles & Apparels": "繊維製品",
+    "Oil & Coal Products": "石油・石炭製品",
+    'Fishery, Agriculture & Forestry': "水産・農林業",
+    '"Fishery, Agriculture & Forestry"': "水産・農林業",
+}
+
+
+def normalize_industry_name(s: str | None) -> str:
+    """EDINET業種（英語）を日本語へ寄せる。日本語が入っている場合はそのまま。"""
+    if s is None:
+        return ""
+    t = str(s).strip()
+    if not t:
+        return ""
+
+    # 余計な引用符を除去
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1].strip()
+
+    return EDINET_INDUSTRY_MAP.get(t, t)
+
+
+# =========================
 # DB helpers
 # =========================
+
 def db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -52,52 +113,75 @@ def table_exists(con, name: str) -> bool:
     return r is not None
 
 
-@st.cache_data(show_spinner=False)
-def has_industry_master() -> bool:
-    with db() as con:
-        return table_exists(con, "industry_master")
+def column_exists(con, table: str, col: str) -> bool:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table});").fetchall()
+        return any(r[1] == col for r in rows)
+    except Exception:
+        return False
 
 
 @st.cache_data(show_spinner=False)
-def list_sector33() -> list[str]:
+def get_edinet_industry_maps() -> tuple[dict[str, str], dict[str, list[str]], list[str]]:
+    """
+    raw_to_disp: DBに入ってる文字列（raw）→ 表示用（日本語寄せ）
+    disp_to_raws: 表示用 → rawの候補（同一表示に複数rawがぶら下がるのを許容）
+    disp_list: 表示用の一覧（ソート済み）
+    """
     with db() as con:
-        if not table_exists(con, "industry_master"):
-            return []
+        if not (table_exists(con, "companies") and table_exists(con, "metrics_yearly")):
+            return {}, {}, []
+        if not column_exists(con, "companies", "edinet_industry"):
+            return {}, {}, []
+
         rows = con.execute(
             """
-            SELECT DISTINCT sector33
-            FROM industry_master
-            WHERE sector33 IS NOT NULL AND TRIM(sector33) <> ''
-            ORDER BY sector33
+            SELECT DISTINCT c.edinet_industry
+            FROM companies c
+            WHERE c.edinet_industry IS NOT NULL
+              AND TRIM(c.edinet_industry) <> ''
+              AND EXISTS (
+                SELECT 1 FROM metrics_yearly my
+                WHERE my.edinet_code = c.edinet_code
+                LIMIT 1
+              )
             """
         ).fetchall()
-    return [r[0] for r in rows]
+
+    raw_list = [r[0] for r in rows if r and r[0] is not None]
+    raw_to_disp = {raw: normalize_industry_name(raw) for raw in raw_list}
+
+    disp_to_raws: dict[str, list[str]] = {}
+    for raw, disp in raw_to_disp.items():
+        if not disp:
+            continue
+        disp_to_raws.setdefault(disp, []).append(raw)
+
+    disp_list = sorted(disp_to_raws.keys())
+    return raw_to_disp, disp_to_raws, disp_list
 
 
 @st.cache_data(show_spinner=False)
-def count_visible_companies(sector33: str | None = None) -> int:
+def count_visible_companies(industry_raws: tuple[str, ...] | None = None) -> int:
     """候補に出る企業数（metrics_yearlyに1行以上ある企業）"""
     with db() as con:
         if not (table_exists(con, "companies") and table_exists(con, "metrics_yearly")):
             return 0
 
-        im_ok = table_exists(con, "industry_master")
-
-        if sector33 and im_ok:
+        if industry_raws:
+            ph = ",".join(["?"] * len(industry_raws))
             row = con.execute(
-                """
+                f"""
                 SELECT COUNT(DISTINCT c.edinet_code)
                 FROM companies c
-                JOIN industry_master im
-                  ON im.securities_code = c.securities_code
-                WHERE im.sector33 = ?
+                WHERE c.edinet_industry IN ({ph})
                   AND EXISTS (
                     SELECT 1 FROM metrics_yearly my
                     WHERE my.edinet_code = c.edinet_code
                     LIMIT 1
                   )
                 """,
-                (sector33,),
+                list(industry_raws),
             ).fetchone()
         else:
             row = con.execute(
@@ -116,31 +200,33 @@ def count_visible_companies(sector33: str | None = None) -> int:
 
 
 @st.cache_data(show_spinner=False)
-def company_search(keyword: str, sector33: str | None, limit: int = 120) -> pd.DataFrame:
+def company_search(keyword: str, industry_raws: tuple[str, ...] | None, limit: int = 120) -> pd.DataFrame:
     """
     ・会社名検索のみ
     ・metrics_yearlyにデータがある企業のみ
-    ・候補表示用に sector33 を付与（JPX33）
-    ・sector33指定があればJPX33で絞る
+    ・候補表示用に edinet_industry を付与
+    ・industry_raws指定があれば EDINET業種で絞る
     """
     keyword = (keyword or "").strip()
     if not keyword:
-        return pd.DataFrame(columns=["edinet_code", "name", "sector33"])
+        return pd.DataFrame(columns=["edinet_code", "name", "edinet_industry"])
 
     with db() as con:
         if not (table_exists(con, "companies") and table_exists(con, "metrics_yearly")):
-            return pd.DataFrame(columns=["edinet_code", "name", "sector33"])
+            return pd.DataFrame(columns=["edinet_code", "name", "edinet_industry"])
 
-        im_ok = table_exists(con, "industry_master")
+        has_eind = column_exists(con, "companies", "edinet_industry")
+        if not has_eind:
+            return pd.DataFrame(columns=["edinet_code", "name", "edinet_industry"])
 
-        if sector33 and im_ok:
+        if industry_raws:
+            ph = ",".join(["?"] * len(industry_raws))
+            params = [*industry_raws, f"%{keyword}%", limit]
             rows = con.execute(
-                """
-                SELECT c.edinet_code, c.name, im.sector33
+                f"""
+                SELECT c.edinet_code, c.name, c.edinet_industry
                 FROM companies c
-                JOIN industry_master im
-                  ON im.securities_code = c.securities_code
-                WHERE im.sector33 = ?
+                WHERE c.edinet_industry IN ({ph})
                   AND c.name LIKE ?
                   AND EXISTS (
                     SELECT 1 FROM metrics_yearly my
@@ -150,50 +236,31 @@ def company_search(keyword: str, sector33: str | None, limit: int = 120) -> pd.D
                 ORDER BY c.name
                 LIMIT ?
                 """,
-                (sector33, f"%{keyword}%", limit),
+                params,
             ).fetchall()
         else:
-            if im_ok:
-                rows = con.execute(
-                    """
-                    SELECT c.edinet_code, c.name, im.sector33
-                    FROM companies c
-                    LEFT JOIN industry_master im
-                      ON im.securities_code = c.securities_code
-                    WHERE c.name LIKE ?
-                      AND EXISTS (
-                        SELECT 1 FROM metrics_yearly my
-                        WHERE my.edinet_code = c.edinet_code
-                        LIMIT 1
-                      )
-                    ORDER BY c.name
-                    LIMIT ?
-                    """,
-                    (f"%{keyword}%", limit),
-                ).fetchall()
-            else:
-                rows = con.execute(
-                    """
-                    SELECT c.edinet_code, c.name, NULL as sector33
-                    FROM companies c
-                    WHERE c.name LIKE ?
-                      AND EXISTS (
-                        SELECT 1 FROM metrics_yearly my
-                        WHERE my.edinet_code = c.edinet_code
-                        LIMIT 1
-                      )
-                    ORDER BY c.name
-                    LIMIT ?
-                    """,
-                    (f"%{keyword}%", limit),
-                ).fetchall()
+            rows = con.execute(
+                """
+                SELECT c.edinet_code, c.name, c.edinet_industry
+                FROM companies c
+                WHERE c.name LIKE ?
+                  AND EXISTS (
+                    SELECT 1 FROM metrics_yearly my
+                    WHERE my.edinet_code = c.edinet_code
+                    LIMIT 1
+                  )
+                ORDER BY c.name
+                LIMIT ?
+                """,
+                (f"%{keyword}%", limit),
+            ).fetchall()
 
     return pd.DataFrame([dict(r) for r in rows])
 
 
 @st.cache_data(show_spinner=False)
 def fetch_labels_for_codes(codes: list[str]) -> dict[str, dict]:
-    """比較中の表示：会社名（JPX33業種）"""
+    """比較中の表示：会社名（EDINET業種）"""
     if not codes:
         return {}
 
@@ -202,22 +269,22 @@ def fetch_labels_for_codes(codes: list[str]) -> dict[str, dict]:
             return {}
 
         ph = ",".join(["?"] * len(codes))
-        im_ok = table_exists(con, "industry_master")
+        has_eind = column_exists(con, "companies", "edinet_industry")
 
-        if im_ok:
+        if has_eind:
             rows = con.execute(
                 f"""
-                SELECT c.edinet_code, c.name, im.sector33
+                SELECT c.edinet_code, c.name, c.edinet_industry
                 FROM companies c
-                LEFT JOIN industry_master im
-                  ON im.securities_code = c.securities_code
                 WHERE c.edinet_code IN ({ph})
                 """,
                 codes,
             ).fetchall()
+
             out = {}
             for r in rows:
-                sec = (r["sector33"] or "").strip() or "業界不明"
+                eind = normalize_industry_name(r["edinet_industry"])
+                sec = eind.strip() if eind else "業界不明"
                 out[r["edinet_code"]] = {"name": r["name"], "label": f"{r['name']}（{sec}）"}
             return out
 
@@ -275,7 +342,6 @@ def to_pct(series_or_value, ratio_threshold: float = 1.5):
     if isinstance(s, pd.Series):
         if s.dropna().empty:
             return s
-        # ★値ごとに判定（Series全体maxで判断しない）
         return s.apply(lambda x: (x * 100) if pd.notna(x) and abs(float(x)) <= ratio_threshold else x)
     else:
         if pd.isna(s):
@@ -286,6 +352,7 @@ def to_pct(series_or_value, ratio_threshold: float = 1.5):
 # =========================
 # 凡例短縮（st.line_chartのまま“収まる”ように）
 # =========================
+
 def _legend_base_name(label: str) -> str:
     if label is None:
         return ""
@@ -318,7 +385,10 @@ def _estimate_total_legend_chars(labels: list[str]) -> int:
     return sum(len(x) + 2 for x in labels)
 
 
-def make_compact_legend_map(columns_in_chart: list[str], force_budget: int | None = None) -> tuple[dict[str, str], list[str] | None]:
+def make_compact_legend_map(
+    columns_in_chart: list[str],
+    force_budget: int | None = None,
+) -> tuple[dict[str, str], list[str] | None]:
     full_labels = [str(c) for c in columns_in_chart]
     base = [_legend_base_name(x) for x in full_labels]
     n = len(base)
@@ -364,6 +434,7 @@ def make_compact_legend_map(columns_in_chart: list[str], force_budget: int | Non
 # =========================
 # CF型（cf_type）自動補完
 # =========================
+
 def classify_cf_type(cfo, cfi, cff) -> str | None:
     cfo = pd.to_numeric(cfo, errors="coerce")
     cfi = pd.to_numeric(cfi, errors="coerce")
@@ -400,6 +471,7 @@ def fill_cf_type(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # CSV helpers（DB比較に混ぜる）
 # =========================
+
 def _read_csv_uploaded(file) -> pd.DataFrame:
     data = file.getvalue()
     try:
@@ -432,7 +504,6 @@ def _normalize_csv_df(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ★比率混在を値ごとに吸収
     if "equity_ratio" in df.columns:
         df["equity_ratio"] = to_pct(df["equity_ratio"], ratio_threshold=1.5)
     if "current_ratio" in df.columns:
@@ -447,18 +518,20 @@ def _normalize_csv_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_industry_avg_jpx33(sector33: str, y_min: int, y_max: int) -> pd.DataFrame:
-    """JPX33業種の年次平均（mean）※DB企業だけで算出"""
+def load_industry_avg_edinet(industry_raws: tuple[str, ...], y_min: int, y_max: int) -> pd.DataFrame:
+    """EDINET業種の年次平均（mean）※DB企業だけで算出"""
+    if not industry_raws:
+        return pd.DataFrame()
+
     with db() as con:
-        if not (
-            table_exists(con, "industry_master")
-            and table_exists(con, "metrics_yearly")
-            and table_exists(con, "companies")
-        ):
+        if not (table_exists(con, "metrics_yearly") and table_exists(con, "companies")):
             return pd.DataFrame()
 
+        ph = ",".join(["?"] * len(industry_raws))
+        params = [*industry_raws, y_min, y_max]
+
         df = pd.read_sql_query(
-            """
+            f"""
             SELECT
               my.fiscal_year,
               my.sales,
@@ -471,13 +544,11 @@ def load_industry_avg_jpx33(sector33: str, y_min: int, y_max: int) -> pd.DataFra
             FROM metrics_yearly my
             JOIN companies c
               ON c.edinet_code = my.edinet_code
-            JOIN industry_master im
-              ON im.securities_code = c.securities_code
-            WHERE im.sector33 = ?
+            WHERE c.edinet_industry IN ({ph})
               AND my.fiscal_year BETWEEN ? AND ?
             """,
             con,
-            params=[sector33, y_min, y_max],
+            params=params,
         )
 
     if df.empty:
@@ -486,7 +557,7 @@ def load_industry_avg_jpx33(sector33: str, y_min: int, y_max: int) -> pd.DataFra
     for col in ["sales", "net_income", "equity_ratio", "current_ratio", "cfo", "cfi", "cff"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ★業界平均は「正規化してから平均」
+    # 比率は「正規化してから平均」
     df["equity_ratio_pct"] = to_pct(df["equity_ratio"], ratio_threshold=1.5)
     df["current_ratio_pct"] = to_pct(df["current_ratio"], ratio_threshold=10.0)
 
@@ -559,6 +630,7 @@ def make_analysis(chart_df: pd.DataFrame, unit: str, avg_label: str | None = Non
 # =========================
 # UI style（hero/panel）
 # =========================
+
 st.set_page_config(page_title="企業分析を5分で！", layout="wide")
 
 st.markdown(
@@ -608,10 +680,11 @@ st.markdown(
 # =========================
 # Session state
 # =========================
+
 if "selected_codes" not in st.session_state:
     st.session_state.selected_codes = []
-if "sector33_sel" not in st.session_state:
-    st.session_state.sector33_sel = "（全業界）"
+if "industry_sel" not in st.session_state:
+    st.session_state.industry_sel = "（全業界）"
 if "show_avg" not in st.session_state:
     st.session_state.show_avg = False
 if "show_analysis" not in st.session_state:
@@ -635,6 +708,7 @@ if "pick_key" not in st.session_state:
 # =========================
 # 削除・リセット
 # =========================
+
 def _remove_from_compare(code: str):
     if str(code).startswith("CSV:"):
         st.session_state.csv_items = [it for it in st.session_state.csv_items if it["id"] != code]
@@ -672,8 +746,16 @@ def _clear_csv_only():
 # =========================
 # 上部操作UI（横並び）
 # =========================
-use_sector = None if st.session_state.sector33_sel == "（全業界）" else st.session_state.sector33_sel
-col_search, col_sector, col_year, col_csv = st.columns([2.3, 1.2, 1.2, 1.5], gap="large")
+
+raw_to_disp, disp_to_raws, disp_list = get_edinet_industry_maps()
+
+use_industry_disp = None if st.session_state.industry_sel == "（全業界）" else st.session_state.industry_sel
+use_industry_raws = None
+if use_industry_disp:
+    raw_candidates = disp_to_raws.get(use_industry_disp, [])
+    use_industry_raws = tuple(sorted(raw_candidates)) if raw_candidates else tuple()
+
+col_search, col_industry, col_year, col_csv = st.columns([2.3, 1.2, 1.2, 1.5], gap="large")
 
 with col_search:
     st.markdown('<div class="panel"><div class="panel-title">企業検索（DB）</div>', unsafe_allow_html=True)
@@ -681,13 +763,13 @@ with col_search:
     kw = st.text_input("会社名で検索", placeholder="例：ニトリ / トヨタ / ソニー", key="kw")
 
     total_n = count_visible_companies(None)
-    if use_sector:
-        n2 = count_visible_companies(use_sector)
-        st.caption(f"対象：{total_n:,}社 / 絞り込み：{n2:,}社（{use_sector}）")
+    if use_industry_disp and use_industry_raws:
+        n2 = count_visible_companies(use_industry_raws)
+        st.caption(f"対象：{total_n:,}社 / 絞り込み：{n2:,}社（{use_industry_disp}）")
     else:
         st.caption(f"対象：{total_n:,}社（指標データあり）")
 
-    df_hits = company_search(kw, use_sector, limit=120)
+    df_hits = company_search(kw, use_industry_raws, limit=120)
 
     picked_labels = []
     label_to_code = {}
@@ -695,8 +777,9 @@ with col_search:
     if not df_hits.empty:
 
         def _lab(r):
-            s = (r.get("sector33") or "").strip() or "業界不明"
-            return f"{r['name']}（{s}）"
+            eind = normalize_industry_name(r.get("edinet_industry"))
+            sec = eind.strip() if eind else "業界不明"
+            return f"{r['name']}（{sec}）"
 
         df_hits["label"] = df_hits.apply(_lab, axis=1)
         label_to_code = dict(zip(df_hits["label"].tolist(), df_hits["edinet_code"].tolist()))
@@ -743,23 +826,20 @@ with col_search:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-with col_sector:
+with col_industry:
     st.markdown('<div class="panel"><div class="panel-title">業界</div>', unsafe_allow_html=True)
 
-    sector33_options = ["（全業界）"]
-    if has_industry_master():
-        sector33_options += list_sector33()
+    industry_options = ["（全業界）"] + disp_list
 
-    new_sector = st.selectbox(
-        "JPX33業種",
-        options=sector33_options,
-        index=sector33_options.index(st.session_state.sector33_sel)
-        if st.session_state.sector33_sel in sector33_options else 0,
-        key="sector_box",
+    new_ind = st.selectbox(
+        "EDINET業種",
+        options=industry_options,
+        index=industry_options.index(st.session_state.industry_sel) if st.session_state.industry_sel in industry_options else 0,
+        key="industry_box",
     )
 
-    if new_sector != st.session_state.sector33_sel:
-        st.session_state.sector33_sel = new_sector
+    if new_ind != st.session_state.industry_sel:
+        st.session_state.industry_sel = new_ind
         _reset_company_picker_widget()
         st.rerun()
 
@@ -833,8 +913,18 @@ with col_csv:
 
                 d1 = fill_cf_type(d1)
                 d1 = d1[
-                    ["edinet_code", "fiscal_year", "sales", "net_income", "equity_ratio", "current_ratio",
-                     "cfo", "cfi", "cff", "cf_type"]
+                    [
+                        "edinet_code",
+                        "fiscal_year",
+                        "sales",
+                        "net_income",
+                        "equity_ratio",
+                        "current_ratio",
+                        "cfo",
+                        "cfi",
+                        "cff",
+                        "cf_type",
+                    ]
                 ]
 
                 st.session_state.csv_items.append({"id": csv_id, "label": f"{f.name}（CSV）", "df": d1})
@@ -860,6 +950,7 @@ with col_csv:
 # =========================
 # 比較中（DB+CSV 合算で最大8）
 # =========================
+
 db_labels_map = fetch_labels_for_codes(st.session_state.selected_codes)
 csv_map = {it["id"]: {"name": it["label"], "label": it["label"]} for it in st.session_state.csv_items}
 labels_map = {**db_labels_map, **csv_map}
@@ -902,6 +993,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 # =========================
 # Load & transform（DB+CSV）
 # =========================
+
 db_codes = [c for c in ordered_codes if not str(c).startswith("CSV:")]
 df_db = load_metrics_yearly(db_codes)
 
@@ -927,7 +1019,6 @@ df = fill_cf_type(df)
 df["sales_oku"] = pd.to_numeric(df.get("sales"), errors="coerce") / 1e8
 df["net_income_oku"] = pd.to_numeric(df.get("net_income"), errors="coerce") / 1e8
 
-# ★比率混在を値ごとに吸収
 df["equity_ratio_pct"] = to_pct(df.get("equity_ratio"), ratio_threshold=1.5)
 df["current_ratio_pct"] = to_pct(df.get("current_ratio"), ratio_threshold=10.0)
 
@@ -941,18 +1032,26 @@ ordered_labels_full = [code_to_label[c] for c in ordered_codes]
 # ★ 銀行の線を消す対象（表示ラベルで判定する＝確実）
 bank_labels = {lbl for lbl in ordered_labels_full if "（銀行業）" in str(lbl)}
 
-selected_sector33 = None if st.session_state.sector33_sel == "（全業界）" else st.session_state.sector33_sel
-is_bank_filter = (selected_sector33 == "銀行業")
+selected_industry = None if st.session_state.industry_sel == "（全業界）" else st.session_state.industry_sel
+is_bank_filter = (selected_industry == "銀行業")
+
 
 # =========================
 # 業界平均（DBのみ）
 # =========================
+
 avg_label = None
 avg_df = pd.DataFrame()
-if st.session_state.show_avg and selected_sector33:
-    avg_df = load_industry_avg_jpx33(selected_sector33, y_min, y_max)
-    if not avg_df.empty:
-        avg_label = f"業界平均（{selected_sector33}）"
+
+industry_avg_raws = None
+if st.session_state.show_avg and selected_industry:
+    raws = disp_to_raws.get(selected_industry, [])
+    industry_avg_raws = tuple(sorted(raws)) if raws else tuple()
+
+    if industry_avg_raws:
+        avg_df = load_industry_avg_edinet(industry_avg_raws, y_min, y_max)
+        if not avg_df.empty:
+            avg_label = f"業界平均（{selected_industry}）"
 
 
 def render_chart(
@@ -975,7 +1074,7 @@ def render_chart(
     if (not hide_avg_line) and avg_label and avg_key and not avg_df.empty:
         base_full = add_avg_line(base_full, avg_df[avg_key], avg_label)
 
-    # ★ 銀行の系列だけ除外（流動比率用）
+    # 銀行の系列だけ除外（流動比率用）
     if exclude_labels:
         keep_cols = [c for c in base_full.columns if c not in exclude_labels]
         base_full = base_full[keep_cols] if keep_cols else pd.DataFrame(index=base_full.index)
@@ -1007,7 +1106,9 @@ def render_chart(
 # =========================
 # Charts
 # =========================
+
 st.markdown('<div class="section-title">収益性</div>', unsafe_allow_html=True)
+
 cA, cB = st.columns(2)
 with cA:
     render_chart("売上高（億円）", "sales_oku", "億円", "sales_oku")
@@ -1015,11 +1116,11 @@ with cB:
     render_chart("当期純利益（億円）", "net_income_oku", "億円", "net_income_oku")
 
 st.markdown('<div class="section-title">安全性</div>', unsafe_allow_html=True)
+
 cC, cD = st.columns(2)
 with cC:
     render_chart("自己資本比率（％）", "equity_ratio_pct", "％", "equity_ratio_pct")
 with cD:
-    # ★ 流動比率：銀行の線だけ消す + 銀行業フィルタ時は平均線も消す
     render_chart(
         "流動比率（％）",
         "current_ratio_pct",
@@ -1028,7 +1129,7 @@ with cD:
         exclude_labels=bank_labels,
         hide_avg_line=is_bank_filter,
         empty_message="銀行業の企業は流動比率から除外しているため、表示できる線がありません。",
-        note="※ 流動比率は開示方法の違いにより、企業や年度によって変動が大きく見える場合があります（銀行業は参考指標外）",
+        note="※ 銀行業では流動比率は参考指標外（系列は非表示）",
     )
 
 st.markdown('<div class="section-title">キャッシュフロー</div>', unsafe_allow_html=True)
@@ -1047,7 +1148,7 @@ for cap, key, avg_key, col in [
         if not base_full.empty:
             base_full = base_full[[c for c in ordered_labels_full if c in base_full.columns]]
 
-        if avg_label and not avg_df.empty:
+        if avg_label and not avg_df.empty and avg_key in avg_df.columns:
             base_full = add_avg_line(base_full, avg_df[avg_key], avg_label)
 
         if base_full.empty:
@@ -1069,9 +1170,11 @@ for cap, key, avg_key, col in [
 
 st.markdown("</div>", unsafe_allow_html=True)
 
+
 # =========================
 # CF表（企業ごと）
 # =========================
+
 st.markdown('<div class="section-title">キャッシュフロー表（企業ごと）</div>', unsafe_allow_html=True)
 st.markdown('<div class="panel"><div class="panel-title">CFO / CFI / CFF（億円）とCF型（年別）</div>', unsafe_allow_html=True)
 
@@ -1097,18 +1200,22 @@ for code in ordered_codes:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
+
 # =========================
 # 生データ
 # =========================
+
 if st.session_state.show_raw:
     st.markdown('<div class="section-title">生データ（DB+CSV）</div>', unsafe_allow_html=True)
     st.markdown('<div class="panel"><div class="panel-title">結合データ（抽出範囲）</div>', unsafe_allow_html=True)
     st.dataframe(df.sort_values(["edinet_code", "fiscal_year"]), use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 # =========================
 # Download
 # =========================
+
 st.markdown('<div class="panel"><div class="panel-title">ダウンロード</div>', unsafe_allow_html=True)
 st.download_button(
     "比較データ（DB+CSV）をCSVでダウンロード",
