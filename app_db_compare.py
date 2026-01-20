@@ -16,6 +16,10 @@
 # ✅ 銀行の流動比率：
 # - 流動比率グラフでは「（銀行業）」が付いている系列だけ非表示（DB結合に依存しない＝確実）
 # - さらに、業界フィルタが「銀行業」のときは、流動比率グラフの業界平均線も表示しない
+#
+# ✅ 重要修正（縦軸おかしい対策）
+# - 比率の単位混在（2.7 と 270 など）を「値ごとに」%正規化して吸収する（Series全体max判定は廃止）
+# - 業界平均は「正規化してから平均」を取る（混在のまま平均すると壊れるため）
 
 import sqlite3
 from io import BytesIO
@@ -262,17 +266,17 @@ def filter_years(df: pd.DataFrame, y_min: int, y_max: int) -> pd.DataFrame:
 
 def to_pct(series_or_value, ratio_threshold: float = 1.5):
     """
-    比率データを % に正規化する
+    比率データを % に正規化する（値ごと判定）
     ratio_threshold:
-      - 自己資本比率 → 1.5
-      - 流動比率     → 10.0
+      - 自己資本比率 → 1.5  （0.6→60, 60→60）
+      - 流動比率     → 10.0 （2.7→270, 270→270）
     """
     s = pd.to_numeric(series_or_value, errors="coerce")
     if isinstance(s, pd.Series):
         if s.dropna().empty:
             return s
-        mx = s.dropna().abs().max()
-        return s * 100 if mx <= ratio_threshold else s
+        # ★値ごとに判定（Series全体maxで判断しない）
+        return s.apply(lambda x: (x * 100) if pd.notna(x) and abs(float(x)) <= ratio_threshold else x)
     else:
         if pd.isna(s):
             return s
@@ -428,11 +432,11 @@ def _normalize_csv_df(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # ★比率混在を値ごとに吸収
     if "equity_ratio" in df.columns:
         df["equity_ratio"] = to_pct(df["equity_ratio"], ratio_threshold=1.5)
     if "current_ratio" in df.columns:
         df["current_ratio"] = to_pct(df["current_ratio"], ratio_threshold=10.0)
-
 
     if df["fiscal_year"].dropna().empty:
         raise ValueError("CSVに year または fiscal_year がありません。")
@@ -482,14 +486,18 @@ def load_industry_avg_jpx33(sector33: str, y_min: int, y_max: int) -> pd.DataFra
     for col in ["sales", "net_income", "equity_ratio", "current_ratio", "cfo", "cfi", "cff"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # ★業界平均は「正規化してから平均」
+    df["equity_ratio_pct"] = to_pct(df["equity_ratio"], ratio_threshold=1.5)
+    df["current_ratio_pct"] = to_pct(df["current_ratio"], ratio_threshold=10.0)
+
     g = df.groupby("fiscal_year")
     out = pd.DataFrame(index=sorted(df["fiscal_year"].dropna().unique()))
     out.index.name = "fiscal_year"
 
     out["sales_oku"] = g["sales"].mean() / 1e8
     out["net_income_oku"] = g["net_income"].mean() / 1e8
-    out["equity_ratio_pct"] = to_pct(g["equity_ratio"].mean(), ratio_threshold=1.5)
-    out["current_ratio_pct"] = to_pct(g["current_ratio"].mean(), ratio_threshold=10.0)
+    out["equity_ratio_pct"] = g["equity_ratio_pct"].mean()
+    out["current_ratio_pct"] = g["current_ratio_pct"].mean()
     out["cfo_oku"] = g["cfo"].mean() / 1e8
     out["cfi_oku"] = g["cfi"].mean() / 1e8
     out["cff_oku"] = g["cff"].mean() / 1e8
@@ -918,8 +926,11 @@ df = fill_cf_type(df)
 
 df["sales_oku"] = pd.to_numeric(df.get("sales"), errors="coerce") / 1e8
 df["net_income_oku"] = pd.to_numeric(df.get("net_income"), errors="coerce") / 1e8
+
+# ★比率混在を値ごとに吸収
 df["equity_ratio_pct"] = to_pct(df.get("equity_ratio"), ratio_threshold=1.5)
 df["current_ratio_pct"] = to_pct(df.get("current_ratio"), ratio_threshold=10.0)
+
 df["cfo_oku"] = pd.to_numeric(df.get("cfo"), errors="coerce") / 1e8
 df["cfi_oku"] = pd.to_numeric(df.get("cfi"), errors="coerce") / 1e8
 df["cff_oku"] = pd.to_numeric(df.get("cff"), errors="coerce") / 1e8
@@ -952,6 +963,7 @@ def render_chart(
     exclude_labels: set[str] | None = None,
     hide_avg_line: bool = False,
     empty_message: str | None = None,
+    note: str | None = None,
 ):
     st.markdown(f'<div class="panel"><div class="panel-title">{title}</div>', unsafe_allow_html=True)
 
@@ -977,6 +989,9 @@ def render_chart(
     base_chart = base_full.rename(columns=rename_map)
 
     st.line_chart(base_chart)
+
+    if note:
+        st.caption(note)
 
     if note_lines:
         with st.expander("凡例対応表（短縮が強いとき）", expanded=False):
@@ -1013,6 +1028,7 @@ with cD:
         exclude_labels=bank_labels,
         hide_avg_line=is_bank_filter,
         empty_message="銀行業の企業は流動比率から除外しているため、表示できる線がありません。",
+        note="※ 流動比率は開示方法の違いにより、企業や年度によって変動が大きく見える場合があります（銀行業は参考指標外）",
     )
 
 st.markdown('<div class="section-title">キャッシュフロー</div>', unsafe_allow_html=True)
