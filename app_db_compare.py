@@ -80,6 +80,10 @@ EDINET_INDUSTRY_MAP = {
     "Iron & Steel": "鉄鋼",
     "Iron and Steel": "鉄鋼",
     "Nonferrous Metals": "非鉄金属",
+    "Oil & Coal Products": "石油・石炭製品",
+    "Precision Instruments": "精密機器",
+    "Textiles & Apparels": "繊維製品",
+
 
     # 金融その他（画像準拠）
     "Other Financial Business": "その他金融業",
@@ -608,6 +612,22 @@ def add_avg_line(chart_df: pd.DataFrame, avg_series: pd.Series, label: str) -> p
     out[label] = avg_series.reindex(chart_df.index)
     return out
 
+def calc_cagr(series: pd.Series, years: list[int]) -> float | None:
+    """
+    年平均成長率（CAGR）を計算
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
+        return None
+
+    start = float(s.iloc[0])
+    end = float(s.iloc[-1])
+    n_years = years[-1] - years[0]
+
+    if start <= 0 or n_years <= 0:
+        return None
+
+    return (end / start) ** (1 / n_years) - 1
 
 def make_analysis(chart_df: pd.DataFrame, unit: str, avg_label: str | None = None) -> list[str]:
     if chart_df.empty or len(chart_df.index) < 2:
@@ -634,6 +654,10 @@ def make_analysis(chart_df: pd.DataFrame, unit: str, avg_label: str | None = Non
         block.append(f"【{col}】")
         block.append(f"{y0}年 → {y1}年で{trend}")
         block.append(f"{a:,.2f}{unit} → {b:,.2f}{unit}")
+        cagr = calc_cagr(s, years)
+        if cagr is not None:
+            block.append(f"年平均成長率（CAGR）：{cagr*100:+.1f}%")
+
 
         if avg_series is not None:
             avg_last = pd.to_numeric(avg_series.reindex(chart_df.index), errors="coerce").iloc[-1]
