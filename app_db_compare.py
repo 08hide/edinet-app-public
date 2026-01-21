@@ -1,7 +1,7 @@
-# app_db_compare.py（EDINET業種・確定仕様 + CSVをDB比較に混ぜる版・全文）
+# app_db_compare.py（EDINET業種を使う版・CSV混在・全文）
 # ✅ 仕様（最新版）
 # - 業界名は「EDINETコードリスト由来（companies.edinet_industry）」を使う
-#   - 英語表記の場合は、日本語表記へ変換（下のEDINET_INDUSTRY_MAP）
+#   - 英語表記の場合は、日本語表記へ変換（EDINET_INDUSTRY_MAP）
 # - 会社検索：会社名検索のみ
 # - 検索候補：metrics_yearlyにデータがある企業のみ
 # - 候補表示：会社名（EDINET業種）※無い場合は「業界不明」
@@ -10,16 +10,20 @@
 # - CSVはDB比較に混ぜる（CSVは企業として追加、最大8件はDB+CSV合算）
 # - 比較中：最大8件、1件1行、右端×削除、全解除（安定）
 # - 期間：2016〜2025 slider（DB/CSV共通）
-# - グラフ：st.line_chart（形態は維持）
-# - 凡例：多いと見えなくなる問題を「自動短縮」で必ず収める（最悪 A/B/C…＋対応表）
+# - グラフ：st.line_chart（維持）
+# - 凡例：自動短縮で必ず収める（最悪 A/B/C…＋対応表）
 # - CF表：企業ごとに分けて表示、最初から展開
 # - 生データ表示トグル、CSVダウンロードあり
-# ✅ 銀行の流動比率：
-# - 流動比率グラフでは「（銀行業）」が付いている系列だけ非表示（表示ラベル判定で確実）
-# - さらに、業界フィルタが「銀行業」のときは、流動比率グラフの業界平均線も表示しない
-# ✅ 流動比率の縦軸対策：
-# - DB内で 2.7（=270%）/ 270（=270%）など単位混在がある前提
-# - to_pct() は「値ごとに」閾値判定して % に揃える（列全体のmax判定はしない）
+#
+# ✅ 銀行業の扱い（重要）
+# - 流動比率グラフ：ラベルに「（銀行業）」が付く系列は非表示
+# - 売上高グラフ：銀行業は売上概念が異なり/欠損が多いので、銀行系列だけ非表示（グラフ自体は表示）
+# - 業界フィルタが「銀行業」のとき：流動比率の業界平均線は非表示
+#
+# ✅ 比率の単位混在対策（重要）
+# - DB内に 2.7（=270%）/ 270（=270%）など混在がある前提
+# - to_pct() は「値ごとに」閾値判定して % に揃える（列全体max判定はしない）
+# - 業界平均は「正規化してから平均」
 
 import sqlite3
 from io import BytesIO
@@ -36,47 +40,68 @@ Y_MAX_FIXED = 2025
 
 
 # =========================
-# EDINET業種（英語→日本語）
+# EDINET業種（英語→日本語：画像の表記に寄せる）
 # =========================
-# DB内の英語表記（edinet_industry_english_unique.csv）に合わせて作成
 EDINET_INDUSTRY_MAP = {
+    # よく出る
     "Others": "その他",
     "Services": "サービス業",
     "Information & Communication": "情報・通信業",
+    "Information and Communication": "情報・通信業",
     "Retail Trade": "小売業",
     "Wholesale Trade": "卸売業",
-    "Electric Appliances": "電気機器",
-    "Machinery": "機械",
-    "Chemicals": "化学",
     "Construction": "建設業",
     "Real Estate": "不動産業",
-    "Foods": "食料品",
-    "Other Products": "その他製品",
     "Banks": "銀行業",
-    "Land Transportation": "陸運業",
-    "Metal Products": "金属製品",
-    "Transportation Equipments": "輸送用機器",
-    "Transportation Equipment": "輸送用機器",
-    "Pharmaceutical": "医薬品",
-    "Other Financing Business": "その他金融業",
-    "Other Financial Business": "その他金融業",
-    "Glass & Ceramics Products": "ガラス・土石製品",
-    "Rubber Products": "ゴム製品",
-    "Pulp & Paper": "パルプ・紙",
-    "Securities & Commodity Futures": "証券、商品先物取引業",
-    "Warehousing & Harbor Transportation Services": "倉庫・運輸関連",
-    "Iron & Steel": "鉄鋼",
-    "Nonferrous Metals": "非鉄金属",
-    "Electric Power & Gas": "電気・ガス業",
     "Insurance": "保険業",
+    "Mining": "鉱業",
+    "Land Transportation": "陸運業",
     "Marine Transportation": "海運業",
     "Air Transportation": "空運業",
-    "Mining": "鉱業",
-    "Precision Instruments": "精密機器",
-    "Textiles & Apparels": "繊維製品",
-    "Oil & Coal Products": "石油・石炭製品",
-    'Fishery, Agriculture & Forestry': "水産・農林業",
+    "Electric Power & Gas": "電気・ガス業",
+    "Electricity and Gas": "電気・ガス業",
+
+    # 製造系（画像準拠）
+    "Chemicals": "化学",
+    "Machinery": "機械",
+    "Metal Products": "金属製品",
+    "Transportation Equipment": "輸送用機器",
+    "Transportation Equipments": "輸送用機器",
+    "Electric Appliances": "電気機器",
+    "Foods": "食料品",
+    "Food Products": "食料品",
+    "Pharmaceutical": "医薬品",
+    "Other Products": "その他製品",
+    "Pulp & Paper": "パルプ・紙",
+    "Pulp and Paper": "パルプ・紙",
+    "Rubber Products": "ゴム製品",
+    "Glass & Ceramics Products": "ガラス・土石製品",
+    "Glass and Stone Products": "ガラス・土石製品",
+    "Iron & Steel": "鉄鋼",
+    "Iron and Steel": "鉄鋼",
+    "Nonferrous Metals": "非鉄金属",
+
+    # 金融その他（画像準拠）
+    "Other Financial Business": "その他金融業",
+    "Other Financing Business": "その他金融業",
+    "Securities & Commodity Futures": "証券、商品先物取引業",
+    "Securities and Commodity Futures": "証券、商品先物取引業",
+
+    # 運輸関連（画像準拠）
+    "Warehousing & Harbor Transportation Services": "倉庫・運輸関連",
+    "Warehousing and Harbor Transportation Services": "倉庫・運輸関連",
+
+    # そのほか（画像準拠で拾えたもの）
+    "Foreign Governments": "外国政府等",
+    "Foreign Corporations and Organizations": "外国法人・組合",
+    "Foreign Corporations and Organizations (with Securities Report Filing Obligation)": "外国法人・組合（有価証券報告書等）",
+    "Domestic Corporations and Organizations (with Securities Report Filing Obligation)": "内国法人・組合（有価証券報告書等の提出義務）",
+    "Individuals (excluding association issuers)": "個人（組合発行者を除く）",
+    "Individuals (Non-resident) (excluding association issuers)": "個人（非居住者）（組合発行者を除く）",
+
+    # もし英語の引用符つきが来ることがあるので保険
     '"Fishery, Agriculture & Forestry"': "水産・農林業",
+    "Fishery, Agriculture & Forestry": "水産・農林業",
 }
 
 
@@ -98,7 +123,6 @@ def normalize_industry_name(s: str | None) -> str:
 # =========================
 # DB helpers
 # =========================
-
 def db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -167,6 +191,8 @@ def count_visible_companies(industry_raws: tuple[str, ...] | None = None) -> int
     with db() as con:
         if not (table_exists(con, "companies") and table_exists(con, "metrics_yearly")):
             return 0
+        if not column_exists(con, "companies", "edinet_industry"):
+            return 0
 
         if industry_raws:
             ph = ",".join(["?"] * len(industry_raws))
@@ -214,9 +240,7 @@ def company_search(keyword: str, industry_raws: tuple[str, ...] | None, limit: i
     with db() as con:
         if not (table_exists(con, "companies") and table_exists(con, "metrics_yearly")):
             return pd.DataFrame(columns=["edinet_code", "name", "edinet_industry"])
-
-        has_eind = column_exists(con, "companies", "edinet_industry")
-        if not has_eind:
+        if not column_exists(con, "companies", "edinet_industry"):
             return pd.DataFrame(columns=["edinet_code", "name", "edinet_industry"])
 
         if industry_raws:
@@ -352,7 +376,6 @@ def to_pct(series_or_value, ratio_threshold: float = 1.5):
 # =========================
 # 凡例短縮（st.line_chartのまま“収まる”ように）
 # =========================
-
 def _legend_base_name(label: str) -> str:
     if label is None:
         return ""
@@ -385,10 +408,7 @@ def _estimate_total_legend_chars(labels: list[str]) -> int:
     return sum(len(x) + 2 for x in labels)
 
 
-def make_compact_legend_map(
-    columns_in_chart: list[str],
-    force_budget: int | None = None,
-) -> tuple[dict[str, str], list[str] | None]:
+def make_compact_legend_map(columns_in_chart: list[str], force_budget: int | None = None) -> tuple[dict[str, str], list[str] | None]:
     full_labels = [str(c) for c in columns_in_chart]
     base = [_legend_base_name(x) for x in full_labels]
     n = len(base)
@@ -434,7 +454,6 @@ def make_compact_legend_map(
 # =========================
 # CF型（cf_type）自動補完
 # =========================
-
 def classify_cf_type(cfo, cfi, cff) -> str | None:
     cfo = pd.to_numeric(cfo, errors="coerce")
     cfi = pd.to_numeric(cfi, errors="coerce")
@@ -471,7 +490,6 @@ def fill_cf_type(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # CSV helpers（DB比較に混ぜる）
 # =========================
-
 def _read_csv_uploaded(file) -> pd.DataFrame:
     data = file.getvalue()
     try:
@@ -525,6 +543,8 @@ def load_industry_avg_edinet(industry_raws: tuple[str, ...], y_min: int, y_max: 
 
     with db() as con:
         if not (table_exists(con, "metrics_yearly") and table_exists(con, "companies")):
+            return pd.DataFrame()
+        if not column_exists(con, "companies", "edinet_industry"):
             return pd.DataFrame()
 
         ph = ",".join(["?"] * len(industry_raws))
@@ -630,7 +650,6 @@ def make_analysis(chart_df: pd.DataFrame, unit: str, avg_label: str | None = Non
 # =========================
 # UI style（hero/panel）
 # =========================
-
 st.set_page_config(page_title="企業分析を5分で！", layout="wide")
 
 st.markdown(
@@ -680,7 +699,6 @@ st.markdown(
 # =========================
 # Session state
 # =========================
-
 if "selected_codes" not in st.session_state:
     st.session_state.selected_codes = []
 if "industry_sel" not in st.session_state:
@@ -708,7 +726,6 @@ if "pick_key" not in st.session_state:
 # =========================
 # 削除・リセット
 # =========================
-
 def _remove_from_compare(code: str):
     if str(code).startswith("CSV:"):
         st.session_state.csv_items = [it for it in st.session_state.csv_items if it["id"] != code]
@@ -746,7 +763,6 @@ def _clear_csv_only():
 # =========================
 # 上部操作UI（横並び）
 # =========================
-
 raw_to_disp, disp_to_raws, disp_list = get_edinet_industry_maps()
 
 use_industry_disp = None if st.session_state.industry_sel == "（全業界）" else st.session_state.industry_sel
@@ -950,7 +966,6 @@ with col_csv:
 # =========================
 # 比較中（DB+CSV 合算で最大8）
 # =========================
-
 db_labels_map = fetch_labels_for_codes(st.session_state.selected_codes)
 csv_map = {it["id"]: {"name": it["label"], "label": it["label"]} for it in st.session_state.csv_items}
 labels_map = {**db_labels_map, **csv_map}
@@ -993,7 +1008,6 @@ st.markdown("</div>", unsafe_allow_html=True)
 # =========================
 # Load & transform（DB+CSV）
 # =========================
-
 db_codes = [c for c in ordered_codes if not str(c).startswith("CSV:")]
 df_db = load_metrics_yearly(db_codes)
 
@@ -1018,10 +1032,8 @@ df = fill_cf_type(df)
 
 df["sales_oku"] = pd.to_numeric(df.get("sales"), errors="coerce") / 1e8
 df["net_income_oku"] = pd.to_numeric(df.get("net_income"), errors="coerce") / 1e8
-
 df["equity_ratio_pct"] = to_pct(df.get("equity_ratio"), ratio_threshold=1.5)
 df["current_ratio_pct"] = to_pct(df.get("current_ratio"), ratio_threshold=10.0)
-
 df["cfo_oku"] = pd.to_numeric(df.get("cfo"), errors="coerce") / 1e8
 df["cfi_oku"] = pd.to_numeric(df.get("cfi"), errors="coerce") / 1e8
 df["cff_oku"] = pd.to_numeric(df.get("cff"), errors="coerce") / 1e8
@@ -1029,17 +1041,15 @@ df["cff_oku"] = pd.to_numeric(df.get("cff"), errors="coerce") / 1e8
 code_to_label = {c: labels_map.get(c, {}).get("label", c) for c in ordered_codes}
 ordered_labels_full = [code_to_label[c] for c in ordered_codes]
 
-# ★ 銀行の線を消す対象（表示ラベルで判定する＝確実）
+# ★ 銀行の系列（表示ラベルで判定）
 bank_labels = {lbl for lbl in ordered_labels_full if "（銀行業）" in str(lbl)}
 
 selected_industry = None if st.session_state.industry_sel == "（全業界）" else st.session_state.industry_sel
 is_bank_filter = (selected_industry == "銀行業")
 
-
 # =========================
 # 業界平均（DBのみ）
 # =========================
-
 avg_label = None
 avg_df = pd.DataFrame()
 
@@ -1071,10 +1081,10 @@ def render_chart(
         base_full = base_full[[c for c in ordered_labels_full if c in base_full.columns]]
 
     # 業界平均（必要なら）
-    if (not hide_avg_line) and avg_label and avg_key and not avg_df.empty:
+    if (not hide_avg_line) and avg_label and avg_key and not avg_df.empty and (avg_key in avg_df.columns):
         base_full = add_avg_line(base_full, avg_df[avg_key], avg_label)
 
-    # 銀行の系列だけ除外（流動比率用）
+    # 指定ラベルの系列を除外
     if exclude_labels:
         keep_cols = [c for c in base_full.columns if c not in exclude_labels]
         base_full = base_full[keep_cols] if keep_cols else pd.DataFrame(index=base_full.index)
@@ -1107,19 +1117,36 @@ def render_chart(
 # Charts
 # =========================
 
+# ---- 収益性 ----
 st.markdown('<div class="section-title">収益性</div>', unsafe_allow_html=True)
-
 cA, cB = st.columns(2)
+
 with cA:
-    render_chart("売上高（億円）", "sales_oku", "億円", "sales_oku")
+    render_chart(
+        "売上高（億円）",
+        "sales_oku",
+        "億円",
+        "sales_oku",
+        exclude_labels=bank_labels,
+        empty_message="銀行業の企業は売上高の概念が一般企業と異なるため、表示できるグラフがありません。",
+        note=(
+            "※ 銀行業は売上高の概念が一般企業と異なるため、銀行のグラフは表示していません"
+            if bank_labels else None
+        ),
+)
+
+
 with cB:
+    # ✅ 当期純利益はここ1回だけ
     render_chart("当期純利益（億円）", "net_income_oku", "億円", "net_income_oku")
 
+# ---- 安全性 ----
 st.markdown('<div class="section-title">安全性</div>', unsafe_allow_html=True)
-
 cC, cD = st.columns(2)
+
 with cC:
     render_chart("自己資本比率（％）", "equity_ratio_pct", "％", "equity_ratio_pct")
+
 with cD:
     render_chart(
         "流動比率（％）",
@@ -1128,10 +1155,15 @@ with cD:
         "current_ratio_pct",
         exclude_labels=bank_labels,
         hide_avg_line=is_bank_filter,
-        empty_message="銀行業の企業は流動比率から除外しているため、表示できる線がありません。",
-        note="※ 銀行業では流動比率は参考指標外（系列は非表示）",
-    )
+        empty_message="銀行業の企業は流動比率が参考にならないため、表示できるグラフがありません。",
+        note=(
+            "※ 銀行業は流動比率が参考にならないため、銀行のグラフは表示していません"
+            if bank_labels else None
+        ),
+)
 
+
+# ---- キャッシュフロー ----
 st.markdown('<div class="section-title">キャッシュフロー</div>', unsafe_allow_html=True)
 st.markdown('<div class="panel"><div class="panel-title">営業CF / 投資CF / 財務CF（億円）</div>', unsafe_allow_html=True)
 
@@ -1148,7 +1180,7 @@ for cap, key, avg_key, col in [
         if not base_full.empty:
             base_full = base_full[[c for c in ordered_labels_full if c in base_full.columns]]
 
-        if avg_label and not avg_df.empty and avg_key in avg_df.columns:
+        if avg_label and (not avg_df.empty) and (avg_key in avg_df.columns):
             base_full = add_avg_line(base_full, avg_df[avg_key], avg_label)
 
         if base_full.empty:
@@ -1170,11 +1202,7 @@ for cap, key, avg_key, col in [
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-
-# =========================
-# CF表（企業ごと）
-# =========================
-
+# ---- CF表（企業ごと）----
 st.markdown('<div class="section-title">キャッシュフロー表（企業ごと）</div>', unsafe_allow_html=True)
 st.markdown('<div class="panel"><div class="panel-title">CFO / CFI / CFF（億円）とCF型（年別）</div>', unsafe_allow_html=True)
 
@@ -1200,22 +1228,14 @@ for code in ordered_codes:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-
-# =========================
-# 生データ
-# =========================
-
+# ---- 生データ ----
 if st.session_state.show_raw:
     st.markdown('<div class="section-title">生データ（DB+CSV）</div>', unsafe_allow_html=True)
     st.markdown('<div class="panel"><div class="panel-title">結合データ（抽出範囲）</div>', unsafe_allow_html=True)
     st.dataframe(df.sort_values(["edinet_code", "fiscal_year"]), use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-
-# =========================
-# Download
-# =========================
-
+# ---- Download ----
 st.markdown('<div class="panel"><div class="panel-title">ダウンロード</div>', unsafe_allow_html=True)
 st.download_button(
     "比較データ（DB+CSV）をCSVでダウンロード",
